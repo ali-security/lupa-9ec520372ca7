@@ -450,9 +450,82 @@ cdef class LuaRuntime:
         if register_eval:
             self.register_py_object(b'eval',     b'eval', eval)
         if register_builtins:
-            self.register_py_object(b'builtins', b'builtins', builtins)
+            if (self._attribute_filter is not None or
+                    self._attribute_getter is not None or self._attribute_setter is not None):
+                # Make sure that the builtin attribute functions cannot be used
+                # to bypass the attribute filter/handlers (CVE-2026-34444).
+                py_builtins = _filtered_builtins(
+                    self._attribute_filter, self._attribute_getter, self._attribute_setter,
+                    self._source_encoding)
+            else:
+                py_builtins = builtins
+            self.register_py_object(b'builtins', b'builtins', py_builtins)
 
         return 0  # nothing left to return on the stack
+
+
+def _filtered_builtins(attribute_filter, attribute_getter, attribute_setter, bytes source_encoding):
+    """
+    Return a copy of the builtins module in which getattr(), setattr(),
+    delattr() and hasattr() are mediated by the attribute filter/handlers
+    of a LuaRuntime, just like attribute access from Lua code.
+    """
+    _getattr, _setattr, _delattr = getattr, setattr, delattr
+    _missing = object()
+
+    def _decode_name(attr_name):
+        if isinstance(attr_name, bytes):
+            attr_name = (<bytes>attr_name).decode(source_encoding)
+        return attr_name
+
+    def _filtered_getattr(obj, attr_name, default=_missing):
+        try:
+            if attribute_getter is not None:
+                return attribute_getter(obj, attr_name)
+            if attribute_filter is not None:
+                attr_name = attribute_filter(obj, attr_name, False)
+            return _getattr(obj, _decode_name(attr_name))
+        except AttributeError:
+            if default is _missing:
+                raise
+            return default
+
+    def _filtered_hasattr(obj, attr_name):
+        try:
+            _filtered_getattr(obj, attr_name)
+        except AttributeError:
+            return False
+        return True
+
+    def _filtered_setattr(obj, attr_name, value):
+        if attribute_setter is not None:
+            attribute_setter(obj, attr_name, value)
+            return
+        if attribute_filter is not None:
+            attr_name = attribute_filter(obj, attr_name, True)
+        _setattr(obj, _decode_name(attr_name), value)
+
+    def _filtered_delattr(obj, attr_name):
+        if attribute_setter is not None:
+            raise AttributeError("deleting attributes is not allowed")
+        if attribute_filter is not None:
+            attr_name = attribute_filter(obj, attr_name, True)
+        _delattr(obj, _decode_name(attr_name))
+
+    def _filtered_vars(*args):
+        if len(args) != 1:
+            raise TypeError("vars() expects exactly one argument")
+        # vars(obj) is obj.__dict__
+        return _filtered_getattr(args[0], '__dict__')
+
+    module = type(builtins)(builtins.__name__)
+    module.__dict__.update(builtins.__dict__)
+    module.getattr = _filtered_getattr
+    module.hasattr = _filtered_hasattr
+    module.setattr = _filtered_setattr
+    module.delattr = _filtered_delattr
+    module.vars = _filtered_vars
+    return module
 
 
 ################################################################################

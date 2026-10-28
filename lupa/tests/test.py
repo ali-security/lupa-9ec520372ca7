@@ -943,6 +943,89 @@ class TestStrNoAutoEncoding(SetupLuaRuntimeMixin, unittest.TestCase):
         self.assertEqual(True, called[0])
 
 
+class TestBuiltinsAttributeFilter(unittest.TestCase):
+    class X(object):
+        a = 1
+        _a = 2
+
+    @staticmethod
+    def attr_filter(obj, name, setting):
+        if isinstance(name, unicode_type) and not name.startswith('_'):
+            return name
+        raise AttributeError('denied')
+
+    def test_builtins_getattr_filtered(self):
+        lua = lupa.LuaRuntime(attribute_filter=self.attr_filter)
+        x = self.X()
+        get = lua.eval('function(obj, name) return python.builtins.getattr(obj, name) end')
+        self.assertEqual(get(x, 'a'), 1)
+        self.assertRaises(AttributeError, get, x, '_a')
+        self.assertRaises(AttributeError, get, x, '__class__')
+        get_default = lua.eval('function(obj, name) return python.builtins.getattr(obj, name, 5) end')
+        self.assertEqual(get_default(x, '__class__'), 5)
+        has = lua.eval('function(obj, name) return python.builtins.hasattr(obj, name) end')
+        self.assertTrue(has(x, 'a'))
+        self.assertFalse(has(x, '__class__'))
+
+    def test_builtins_setattr_filtered(self):
+        lua = lupa.LuaRuntime(attribute_filter=self.attr_filter)
+        x = self.X()
+        set_attr = lua.eval('function(obj, name, value) python.builtins.setattr(obj, name, value) end')
+        set_attr(x, 'a', 10)
+        self.assertEqual(x.a, 10)
+        self.assertRaises(AttributeError, set_attr, x, '_a', 10)
+        self.assertEqual(x._a, 2)
+        del_attr = lua.eval('function(obj, name) python.builtins.delattr(obj, name) end')
+        self.assertRaises(AttributeError, del_attr, x, '_a')
+        del_attr(x, 'a')
+        self.assertEqual(x.a, 1)
+
+    def test_builtins_sandbox_escape(self):
+        lua = lupa.LuaRuntime(attribute_filter=self.attr_filter)
+        escape = lua.eval('''
+            function(obj)
+                local getattr = python.builtins.getattr
+                local cls = getattr(obj, "__class__")
+                return getattr(cls, "__mro__")
+            end
+        ''')
+        self.assertRaises(AttributeError, escape, self.X())
+
+    def test_builtins_vars_filtered(self):
+        lua = lupa.LuaRuntime(attribute_filter=self.attr_filter)
+        get_vars = lua.eval('function(obj) return python.builtins.vars(obj) end')
+        self.assertRaises(AttributeError, get_vars, self.X)
+        self.assertRaises(AttributeError, get_vars, self.X())
+
+    def test_builtins_attribute_handlers(self):
+        def getter(obj, name):
+            if name.startswith('_'):
+                raise AttributeError('denied')
+            return getattr(obj, name)
+
+        def setter(obj, name, value):
+            if name.startswith('_'):
+                raise AttributeError('denied')
+            setattr(obj, name, value)
+
+        lua = lupa.LuaRuntime(attribute_handlers=(getter, setter))
+        x = self.X()
+        get = lua.eval('function(obj, name) return python.builtins.getattr(obj, name) end')
+        self.assertEqual(get(x, 'a'), 1)
+        self.assertRaises(AttributeError, get, x, '__class__')
+        set_attr = lua.eval('function(obj, name, value) python.builtins.setattr(obj, name, value) end')
+        set_attr(x, 'a', 10)
+        self.assertEqual(x.a, 10)
+        self.assertRaises(AttributeError, set_attr, x, '_a', 10)
+        self.assertEqual(x._a, 2)
+
+    def test_builtins_unfiltered_without_filter(self):
+        lua = lupa.LuaRuntime()
+        get = lua.eval('function(obj, name) return python.builtins.getattr(obj, name) end')
+        self.assertEqual(get(self.X(), '__class__'), self.X)
+        self.assertTrue(lua.eval('python.builtins.getattr') is getattr)
+
+
 class TestAttributeHandlers(unittest.TestCase):
     def setUp(self):
         self.lua = lupa.LuaRuntime()
