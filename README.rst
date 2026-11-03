@@ -840,6 +840,21 @@ follows:
 The ``is_setting`` flag indicates whether the attribute is being read
 or set.
 
+When an attribute filter (or the attribute handlers below) is used,
+``python.builtins`` is a filtered copy of Python's builtins module:
+its ``getattr()``, ``hasattr()``, ``setattr()``, ``delattr()`` and
+``vars()`` functions go through the filter as well, and ``globals()``,
+``locals()``, ``eval()``, ``exec()``, ``execfile()``, ``compile()`` and
+``breakpoint()`` are not available.  Pass ``register_builtins=False``
+to not expose the builtins to Lua at all.  In addition, Lua code can
+never access the introspection attributes that lead to the globals,
+builtins or frames of functions, generators, coroutines and tracebacks
+(``func_globals``, ``func_closure``, ``func_code``, ``func_dict``,
+``gi_frame``, ``gi_code``, ``cr_frame``, ``cr_code``, ``ag_frame``,
+``ag_code``, ``tb_frame``, ``f_globals``, ``f_locals``, ``f_builtins``
+and ``f_back``) when a filter or attribute handlers are used, whatever
+name the filter returns.
+
 Note that the attributes of Python functions provide access to the
 current ``globals()`` and therefore to the builtins etc.  If you want
 to safely restrict access to a known set of Python objects, it is best

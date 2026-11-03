@@ -1116,6 +1116,377 @@ class TestAttributeHandlers(unittest.TestCase):
         self.assertEqual(function(self.d), None)
 
 
+class TestBuiltinsAttributeFilter(unittest.TestCase):
+    """
+    Lua code must not be able to side-step the attribute_filter /
+    attribute_handlers through the functions in "python.builtins".
+    """
+    class Obj(object):
+        public = 1
+        _private = 2
+
+    @staticmethod
+    def attr_filter(obj, attr_name, is_setting):
+        if isinstance(attr_name, unicode_type):
+            if not attr_name.startswith('_'):
+                return attr_name
+        raise AttributeError('access denied')
+
+    def setUp(self):
+        self.lua = lupa.LuaRuntime(register_eval=False, attribute_filter=self.attr_filter)
+        self.obj = self.Obj()
+
+    def tearDown(self):
+        self.lua = None
+        gc.collect()
+
+    def _builtins_module(self):
+        try:
+            import __builtin__ as builtins_module
+        except ImportError:
+            import builtins as builtins_module
+        return builtins_module
+
+    def test_getattr_filtered(self):
+        # the exploit chain from the advisory starts like this
+        self.assertRaises(AttributeError, self.lua.eval,
+                          'python.builtins.getattr(python.builtins.object, "__subclasses__")')
+        self.assertRaises(AttributeError, self.lua.execute, '''
+            local getattr = python.builtins.getattr
+            local cls = getattr(python.builtins.object, "__class__")
+            return getattr(cls, "__subclasses__")()
+        ''')
+        getattr_func = self.lua.eval('function(obj, name) return python.builtins.getattr(obj, name) end')
+        self.assertRaises(AttributeError, getattr_func, self.obj, '_private')
+        self.assertRaises(AttributeError, getattr_func, self.obj, '__class__')
+        self.assertRaises(AttributeError, getattr_func, self.obj, '__dict__')
+        self.assertEqual(1, getattr_func(self.obj, 'public'))
+
+    def test_getattr_default(self):
+        getattr_func = self.lua.eval(
+            'function(obj, name) return python.builtins.getattr(obj, name, "default") end')
+        self.assertEqual('default', getattr_func(self.obj, '_private'))
+        self.assertEqual('default', getattr_func(self.obj, '__class__'))
+        self.assertEqual('default', getattr_func(self.obj, 'missing'))
+        self.assertEqual(1, getattr_func(self.obj, 'public'))
+
+    def test_getattr_arguments(self):
+        self.assertRaises(TypeError, self.lua.eval, 'python.builtins.getattr(python.builtins.object)')
+        self.assertRaises(TypeError, self.lua.eval, 'python.builtins.getattr()')
+
+    def test_hasattr_filtered(self):
+        hasattr_func = self.lua.eval('function(obj, name) return python.builtins.hasattr(obj, name) end')
+        self.assertEqual(False, hasattr_func(self.obj, '_private'))
+        self.assertEqual(False, hasattr_func(self.obj, '__class__'))
+        self.assertEqual(False, hasattr_func(self.obj, 'missing'))
+        self.assertEqual(True, hasattr_func(self.obj, 'public'))
+
+    def test_setattr_filtered(self):
+        setattr_func = self.lua.eval(
+            'function(obj, name, value) python.builtins.setattr(obj, name, value) end')
+        self.assertRaises(AttributeError, setattr_func, self.obj, '_private', 5)
+        self.assertEqual(2, self.obj._private)
+        self.assertRaises(AttributeError, setattr_func, self.obj, '__class__', self.Obj)
+        self.assertRaises(AttributeError, setattr_func, self.obj, '_new', 5)
+        self.assertFalse(hasattr(self.obj, '_new'))
+
+        setattr_func(self.obj, 'public', 5)
+        self.assertEqual(5, self.obj.public)
+
+    def test_delattr_filtered(self):
+        delattr_func = self.lua.eval('function(obj, name) python.builtins.delattr(obj, name) end')
+        self.obj._private = 5
+        self.assertRaises(AttributeError, delattr_func, self.obj, '_private')
+        self.assertEqual(5, self.obj._private)
+
+        self.obj.public = 5
+        delattr_func(self.obj, 'public')
+        self.assertEqual(1, self.obj.public)  # instance attribute removed
+
+    def test_vars_filtered(self):
+        vars_func = self.lua.eval('function(obj) return python.builtins.vars(obj) end')
+        self.assertRaises(AttributeError, vars_func, self.obj)
+        self.assertRaises(AttributeError, vars_func, self.Obj)
+        self.assertRaises(TypeError, self.lua.eval, 'python.builtins.vars()')
+
+    def test_globals_locals_not_available(self):
+        # route to the unfiltered builtins through the globals() dict
+        self.assertRaises(AttributeError, self.lua.eval,
+                          'python.as_itemgetter(python.builtins.globals())["__builtins__"]')
+        self.assertRaises(AttributeError, self.lua.eval,
+                          'python.as_itemgetter(python.builtins.locals())["__builtins__"]')
+        self.assertRaises(AttributeError, self.lua.execute, '''
+            local real_builtins = python.as_itemgetter(python.builtins.globals())["__builtins__"]
+            return real_builtins.getattr(python.builtins.object, "__subclasses__")()
+        ''')
+
+    def test_code_execution_functions_not_available(self):
+        builtins_module = self._builtins_module()
+        lua_builtins = self.lua.eval('python.builtins')
+        self.assertTrue(lua_builtins is not builtins_module)
+        namespace = vars(lua_builtins)
+        for name in ('globals', 'locals', 'eval', 'exec', 'execfile', 'compile', 'breakpoint',
+                     '__builtins__'):
+            self.assertFalse(name in namespace, name)
+        for name in ('getattr', 'hasattr', 'setattr', 'delattr', 'vars'):
+            self.assertTrue(namespace[name] is not getattr(builtins_module, name), name)
+        # other builtins are still available
+        self.assertTrue(namespace['str'] is str)
+        self.assertEqual('4', self.lua.eval('python.builtins.str(4)'))
+
+        self.assertRaises(AttributeError, self.lua.eval, 'python.builtins.eval("1+1")')
+        self.assertRaises(AttributeError, self.lua.eval, 'python.builtins.compile("1", "x", "eval")')
+
+    def test_builtins_modification_is_local(self):
+        builtins_module = self._builtins_module()
+        try:
+            self.lua.execute('python.builtins.lupa_test_marker = 1')
+            self.assertEqual(1, self.lua.eval('python.builtins.lupa_test_marker'))
+            self.assertFalse(hasattr(builtins_module, 'lupa_test_marker'))
+        finally:
+            if hasattr(builtins_module, 'lupa_test_marker'):
+                del builtins_module.lupa_test_marker
+
+    def test_mediated_builtin_cannot_be_copied_unfiltered(self):
+        self.assertRaises(TypeError, self.lua.execute, '''
+            local unfiltered_getattr = python.builtins.type(python.builtins.getattr)()
+            return unfiltered_getattr(python.builtins.object, "__subclasses__")
+        ''')
+        self.assertRaises(AttributeError, self.lua.eval,
+                          'python.builtins.getattr(python.builtins.getattr, "__reduce__")')
+
+    def test_bytes_attribute_names(self):
+        def bytes_filter(obj, attr_name, is_setting):
+            if isinstance(attr_name, bytes) and not attr_name.startswith(b'_'):
+                return attr_name
+            raise AttributeError('access denied')
+
+        lua = lupa.LuaRuntime(encoding=None, register_eval=False, attribute_filter=bytes_filter)
+        getattr_func = lua.eval('function(obj, name) return python.builtins.getattr(obj, name) end')
+        self.assertEqual(1, getattr_func(self.obj, b'public'))
+        self.assertRaises(AttributeError, getattr_func, self.obj, b'_private')
+        setattr_func = lua.eval(
+            'function(obj, name, value) python.builtins.setattr(obj, name, value) end')
+        setattr_func(self.obj, b'public', 7)
+        self.assertEqual(7, self.obj.public)
+        self.assertRaises(AttributeError, setattr_func, self.obj, b'_private', 5)
+        self.assertEqual(2, self.obj._private)
+
+    def test_attribute_getter(self):
+        obj_type = self.Obj
+
+        def getter(obj, attr_name):
+            if isinstance(obj, obj_type):
+                if attr_name == 'public':
+                    return 'from getter'
+                raise AttributeError('access denied')
+            return getattr(obj, attr_name)
+
+        lua = lupa.LuaRuntime(register_eval=False, attribute_handlers=(getter, None))
+        self.assertTrue(lua.eval('python.builtins') is not self._builtins_module())
+        getattr_func = lua.eval('function(obj, name) return python.builtins.getattr(obj, name) end')
+        self.assertEqual('from getter', getattr_func(self.obj, 'public'))
+        self.assertRaises(AttributeError, getattr_func, self.obj, '_private')
+        self.assertRaises(AttributeError, getattr_func, self.obj, '__class__')
+        self.assertEqual('dflt', lua.eval(
+            'function(obj) return python.builtins.getattr(obj, "_private", "dflt") end')(self.obj))
+        self.assertEqual(False, lua.eval(
+            'function(obj) return python.builtins.hasattr(obj, "_private") end')(self.obj))
+        self.assertRaises(AttributeError, lua.eval(
+            'function(obj) return python.builtins.vars(obj) end'), self.obj)
+        # no hook for deleting attributes
+        self.obj.public = 5
+        self.assertRaises(AttributeError, lua.eval(
+            'function(obj) python.builtins.delattr(obj, "public") end'), self.obj)
+        self.assertEqual(5, self.obj.public)
+
+    def test_attribute_setter(self):
+        obj_type = self.Obj
+        calls = []
+
+        def setter(obj, attr_name, value):
+            calls.append((attr_name, value))
+            if isinstance(obj, obj_type) and attr_name == 'public':
+                obj.public = value
+                return
+            raise AttributeError('access denied')
+
+        lua = lupa.LuaRuntime(register_eval=False, attribute_handlers=(None, setter))
+        setattr_func = lua.eval(
+            'function(obj, name, value) python.builtins.setattr(obj, name, value) end')
+        setattr_func(self.obj, 'public', 3)
+        self.assertEqual(3, self.obj.public)
+        self.assertRaises(AttributeError, setattr_func, self.obj, '_private', 5)
+        self.assertEqual(2, self.obj._private)
+        self.assertEqual([('public', 3), ('_private', 5)], calls)
+
+    INTROSPECTION_ATTRS = [
+        'func_globals', 'func_closure', 'func_code', 'func_dict',
+        'gi_frame', 'gi_code', 'cr_frame', 'cr_code', 'ag_frame', 'ag_code',
+        'tb_frame', 'f_globals', 'f_locals', 'f_builtins', 'f_back',
+    ]
+
+    def _assert_refused(self, func, *args):
+        try:
+            func(*args)
+        except AttributeError as exc:
+            self.assertTrue('is not allowed' in str(exc), str(exc))
+        else:
+            self.fail("AttributeError not raised")
+
+    def test_lua_function_method_func_globals(self):
+        # Lupa's own (Cython) methods expose the lupa module globals,
+        # which contain LuaRuntime and the real builtins.
+        route = "python.builtins.getattr(function() end, 'coroutine').func_globals"
+        module_globals = lupa.LuaRuntime().eval(route)  # unfiltered runtime: reachable
+        self.assertTrue('LuaRuntime' in module_globals)
+
+        self.assertTrue(self.lua.eval("python.builtins.getattr(function() end, 'coroutine')") is not None)
+        self._assert_refused(self.lua.eval, route)
+        self._assert_refused(self.lua.eval, (
+            "python.builtins.getattr(python.builtins.getattr(function() end, 'coroutine'), 'func_globals')"))
+        self._assert_refused(self.lua.execute, '''
+            local g = python.builtins.getattr(function() end, 'coroutine').func_globals
+            local runtime = python.as_itemgetter(g)["LuaRuntime"]()
+            return runtime.eval('python.eval("1+1")')
+        ''')
+        self.assertEqual('dflt', self.lua.eval(
+            "python.builtins.getattr(python.builtins.getattr(function() end, 'coroutine'), 'func_globals', 'dflt')"))
+        self.assertEqual(False, self.lua.eval(
+            "python.builtins.hasattr(python.builtins.getattr(function() end, 'coroutine'), 'func_closure')"))
+
+    def test_lua_table_type_method_func_globals(self):
+        route = "python.as_attrgetter(python.builtins.type({})).keys.func_globals"
+        module_globals = lupa.LuaRuntime().eval(route)  # unfiltered runtime: reachable
+        self.assertTrue('LuaRuntime' in module_globals)
+
+        self.assertTrue(self.lua.eval("python.as_attrgetter(python.builtins.type({})).keys") is not None)
+        self._assert_refused(self.lua.eval, route)
+        self._assert_refused(self.lua.eval, (
+            "python.builtins.getattr(python.builtins.getattr(python.builtins.type({}), 'keys'), 'func_globals')"))
+        self._assert_refused(self.lua.execute, '''
+            local g = python.as_attrgetter(python.builtins.type({})).keys.func_globals
+            local real_builtins = python.as_itemgetter(g)["__builtins__"]
+            return real_builtins.getattr(python.builtins.object, "__subclasses__")()
+        ''')
+
+    def test_introspection_attributes_refused(self):
+        class Introspectable(object):
+            pass
+        names = self.INTROSPECTION_ATTRS
+        obj = Introspectable()
+        for name in names:
+            setattr(obj, name, name)
+
+        lua_get = self.lua.eval('function(obj, name) return obj[name] end')
+        lua_set = self.lua.eval('function(obj, name) obj[name] = 1 end')
+        builtins_get = self.lua.eval('function(obj, name) return python.builtins.getattr(obj, name) end')
+        builtins_get_default = self.lua.eval(
+            'function(obj, name) return python.builtins.getattr(obj, name, "dflt") end')
+        builtins_has = self.lua.eval('function(obj, name) return python.builtins.hasattr(obj, name) end')
+        builtins_set = self.lua.eval(
+            'function(obj, name) python.builtins.setattr(obj, name, 1) end')
+        builtins_del = self.lua.eval('function(obj, name) python.builtins.delattr(obj, name) end')
+        for name in names:
+            self._assert_refused(lua_get, obj, name)
+            self._assert_refused(lua_set, obj, name)
+            self._assert_refused(builtins_get, obj, name)
+            self.assertEqual('dflt', builtins_get_default(obj, name))
+            self.assertEqual(False, builtins_has(obj, name))
+            self._assert_refused(builtins_set, obj, name)
+            self._assert_refused(builtins_del, obj, name)
+            self.assertEqual(name, getattr(obj, name))
+
+        # the final name after filtering is checked
+        def renaming_filter(obj, attr_name, is_setting):
+            if attr_name == 'g':
+                return 'func_globals'
+            return attr_name
+
+        lua = lupa.LuaRuntime(register_eval=False, attribute_filter=renaming_filter)
+        self._assert_refused(lua.eval('function(obj) return obj.g end'), obj)
+        self._assert_refused(lua.eval('function(obj) obj.g = 1 end'), obj)
+        self._assert_refused(lua.eval('function(obj) return python.builtins.getattr(obj, "g") end'), obj)
+        self.assertEqual(1, lua.eval('function(obj) return obj.public end')(self.Obj()))
+
+        # without a filter or handlers, nothing changes
+        unfiltered = lupa.LuaRuntime()
+        unfiltered_get = unfiltered.eval('function(obj, name) return obj[name] end')
+        for name in names:
+            self.assertEqual(name, unfiltered_get(obj, name))
+
+    def test_introspection_attributes_bytes_names(self):
+        class Introspectable(object):
+            func_globals = 'x'
+
+        def bytes_filter(obj, attr_name, is_setting):
+            if isinstance(attr_name, bytes) and not attr_name.startswith(b'_'):
+                return attr_name
+            raise AttributeError('access denied')
+
+        lua = lupa.LuaRuntime(encoding=None, register_eval=False, attribute_filter=bytes_filter)
+        self._assert_refused(lua.eval('function(obj) return obj.func_globals end'), Introspectable())
+        self._assert_refused(lua.eval(
+            'function(obj) return python.builtins.getattr(obj, "func_globals") end'), Introspectable())
+
+        calls = []
+
+        def getter(obj, attr_name):
+            calls.append(attr_name)
+            return getattr(obj, attr_name.decode('ascii'))
+
+        lua = lupa.LuaRuntime(encoding=None, register_eval=False, attribute_handlers=(getter, None))
+        self._assert_refused(lua.eval('function(obj) return obj.func_globals end'), Introspectable())
+        self.assertEqual([], calls)
+
+    def test_introspection_attributes_refused_with_handlers(self):
+        class Introspectable(object):
+            func_globals = 'x'
+            f_back = 'y'
+        calls = []
+
+        def getter(obj, attr_name):
+            if isinstance(obj, Introspectable):  # not for 'python.builtins.getattr' etc.
+                calls.append(('get', attr_name))
+            return getattr(obj, attr_name)
+
+        def setter(obj, attr_name, value):
+            if isinstance(obj, Introspectable):
+                calls.append(('set', attr_name))
+            setattr(obj, attr_name, value)
+
+        for handlers in [(getter, setter), (getter, None), (None, setter)]:
+            lua = lupa.LuaRuntime(register_eval=False, attribute_handlers=handlers)
+            obj = Introspectable()
+            for name in ('func_globals', 'f_back'):
+                self._assert_refused(lua.eval('function(obj, name) return obj[name] end'), obj, name)
+                self._assert_refused(lua.eval('function(obj, name) obj[name] = 1 end'), obj, name)
+                self._assert_refused(lua.eval(
+                    'function(obj, name) return python.builtins.getattr(obj, name) end'), obj, name)
+                self._assert_refused(lua.eval(
+                    'function(obj, name) python.builtins.setattr(obj, name, 1) end'), obj, name)
+            self.assertEqual('x', Introspectable.func_globals)
+            self.assertFalse('func_globals' in vars(obj))
+        self.assertEqual([], calls)
+
+        # other names still go through the handlers
+        lua = lupa.LuaRuntime(register_eval=False, attribute_handlers=(getter, setter))
+        obj = Introspectable()
+        lua.eval('function(obj) obj.other = 1 end')(obj)
+        self.assertEqual(1, lua.eval('function(obj) return obj.other end')(obj))
+        self.assertEqual([('set', 'other'), ('get', 'other')], calls)
+
+    def test_no_filter_unchanged(self):
+        builtins_module = self._builtins_module()
+        self.assertTrue(lupa.LuaRuntime().eval('python.builtins') is builtins_module)
+        self.assertTrue(lupa.LuaRuntime(attribute_handlers=(None, None)).eval(
+            'python.builtins') is builtins_module)
+        lua = lupa.LuaRuntime()
+        self.assertTrue(lua.eval('python.builtins.getattr') is getattr)
+        self.assertEqual(2, lua.eval(
+            'function(obj) return python.builtins.getattr(obj, "_private") end')(self.obj))
+
+
 class TestPythonObjectsInLua(SetupLuaRuntimeMixin, unittest.TestCase):
     def test_explicit_python_function(self):
         lua_func = self.lua.eval(

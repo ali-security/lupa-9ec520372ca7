@@ -156,7 +156,17 @@ cdef class LuaRuntime:
       Normally, it should return an attribute name that will then be
       used for the lookup.  If it wants to prevent access, it should
       raise an ``AttributeError``.  Note that Lua does not guarantee
-      that the names will be strings.  (New in Lupa 0.20)
+      that the names will be strings.  The filter (or the
+      ``attribute_handlers`` below) also applies to the attribute access
+      functions in ``python.builtins``, see ``register_builtins``.
+      When a filter or handlers are set, Lua code can never access the
+      introspection attributes that lead to the globals, builtins or
+      frames of functions, generators, coroutines and tracebacks, i.e.
+      ``func_globals``, ``func_closure``, ``func_code``, ``func_dict``,
+      ``gi_frame``, ``gi_code``, ``cr_frame``, ``cr_code``, ``ag_frame``,
+      ``ag_code``, ``tb_frame``, ``f_globals``, ``f_locals``,
+      ``f_builtins`` and ``f_back``, regardless of the filter's result.
+      (New in Lupa 0.20)
 
     * ``attribute_handlers``: like ``attribute_filter`` above, but
       handles the getting/setting itself rather than giving hints
@@ -176,6 +186,12 @@ cdef class LuaRuntime:
       code as ``python.builtins.*``?  Note that this does not prevent access
       to the globals available as special Python function attributes, for
       example.  Use an ``attribute_filter`` function for that.
+      If an ``attribute_filter`` or ``attribute_handlers`` is set,
+      ``python.builtins`` is a filtered copy of the builtins module:
+      its ``getattr()``, ``hasattr()``, ``setattr()``, ``delattr()`` and
+      ``vars()`` go through the filter/handlers, and ``globals()``,
+      ``locals()``, ``eval()``, ``exec()``, ``execfile()``, ``compile()``
+      and ``breakpoint()`` are not available.
       (default: True, new in Lupa 1.2)
 
     * ``unpack_returned_tuples``: should Python tuples be unpacked in Lua?
@@ -450,7 +466,14 @@ cdef class LuaRuntime:
         if register_eval:
             self.register_py_object(b'eval',     b'eval', eval)
         if register_builtins:
-            self.register_py_object(b'builtins', b'builtins', builtins)
+            if not _mediates_attributes(self):
+                self.register_py_object(b'builtins', b'builtins', builtins)
+            else:
+                # Do not let Lua code bypass the attribute filter/handlers
+                # through getattr() & friends from the builtins.
+                self.register_py_object(b'builtins', b'builtins', _filtered_builtins(
+                    self._attribute_filter, self._attribute_getter, self._attribute_setter,
+                    self._source_encoding))
 
         return 0  # nothing left to return on the stack
 
@@ -1557,6 +1580,38 @@ cdef int py_object_str(lua_State* L) nogil:
 #   Note that when getattr() is used, attribute_filter from LuaRuntime
 #   may mediate access.  attribute_filter does not come into play when
 #   using the getitem method of access.
+#
+#   When an attribute_filter or attribute_handlers is set, the attribute
+#   names in _INTROSPECTION_ATTRS are always refused (after filtering).
+
+# Non-dunder introspection attributes of functions, generators, coroutines,
+# tracebacks and frames that lead to their globals, builtins or frames.
+# (Cython functions provide "func_*" also in Python 3.)
+cdef frozenset _INTROSPECTION_ATTRS = frozenset([
+    'func_globals', 'func_closure', 'func_code', 'func_dict',
+    'gi_frame', 'gi_code', 'cr_frame', 'cr_code', 'ag_frame', 'ag_code',
+    'tb_frame', 'f_globals', 'f_locals', 'f_builtins', 'f_back',
+])
+
+
+cdef inline bint _mediates_attributes(LuaRuntime runtime):
+    return (runtime._attribute_filter is not None or
+            runtime._attribute_getter is not None or
+            runtime._attribute_setter is not None)
+
+
+cdef int _refuse_introspection_attr(attr_name, bytes source_encoding) except -1:
+    # Raise an AttributeError if 'attr_name' (decoded if it is a byte string)
+    # is one of the _INTROSPECTION_ATTRS.
+    if isinstance(attr_name, bytes):
+        try:
+            attr_name = (<bytes>attr_name).decode(source_encoding)
+        except UnicodeDecodeError:
+            return 0  # cannot be one of the (ASCII) names
+    if isinstance(attr_name, unicode) and attr_name in _INTROSPECTION_ATTRS:
+        raise AttributeError("access to attribute '%s' is not allowed" % attr_name)
+    return 0
+
 
 cdef int getitem_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, int key_n) except -1:
     return py_to_lua(runtime, L,
@@ -1570,12 +1625,15 @@ cdef int getattr_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, in
     obj = <object>py_obj.obj
     attr_name = py_from_lua(runtime, L, key_n)
     if runtime._attribute_getter is not None:
+        _refuse_introspection_attr(attr_name, runtime._source_encoding)
         value = runtime._attribute_getter(obj, attr_name)
         return py_to_lua(runtime, L, value)
     if runtime._attribute_filter is not None:
         attr_name = runtime._attribute_filter(obj, attr_name, False)
     if isinstance(attr_name, bytes):
         attr_name = (<bytes>attr_name).decode(runtime._source_encoding)
+    if _mediates_attributes(runtime):
+        _refuse_introspection_attr(attr_name, runtime._source_encoding)
     return py_to_lua(runtime, L, getattr(obj, attr_name))
 
 cdef int setattr_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, int key_n, int value_n) except -1:
@@ -1583,14 +1641,177 @@ cdef int setattr_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, in
     attr_name = py_from_lua(runtime, L, key_n)
     attr_value = py_from_lua(runtime, L, value_n)
     if runtime._attribute_setter is not None:
+        _refuse_introspection_attr(attr_name, runtime._source_encoding)
         runtime._attribute_setter(obj, attr_name, attr_value)
     else:
         if runtime._attribute_filter is not None:
             attr_name = runtime._attribute_filter(obj, attr_name, True)
         if isinstance(attr_name, bytes):
             attr_name = (<bytes>attr_name).decode(runtime._source_encoding)
+        if _mediates_attributes(runtime):
+            _refuse_introspection_attr(attr_name, runtime._source_encoding)
         setattr(obj, attr_name, attr_value)
     return 0
+
+
+# Builtins for Lua code when an attribute_filter or attribute_handlers is set.
+#
+# The plain builtins module would let Lua code side-step the filter/handlers,
+# e.g. through python.builtins.getattr(obj, "__class__"), so such runtimes get
+# a copy of the builtins module in which the attribute access functions are
+# mediated exactly like "obj.attr" access from Lua (see getattr_for_lua() and
+# setattr_for_lua() above), and in which the functions that hand out the
+# unmediated builtins/namespaces or run arbitrary Python code are removed.
+
+cdef enum _MediatedBuiltinKind:
+    MEDIATED_GETATTR = 1
+    MEDIATED_HASATTR = 2
+    MEDIATED_SETATTR = 3
+    MEDIATED_DELATTR = 4
+    MEDIATED_VARS = 5
+
+
+@cython.final
+@cython.internal
+@cython.no_gc_clear   # keep the filter in place, even during runtime cleanup
+@cython.auto_pickle(False)
+cdef class _MediatedBuiltin:
+    """Replacement for one of the builtins getattr(), hasattr(), setattr(),
+    delattr() and vars() that applies the attribute_filter / attribute_handlers
+    of a LuaRuntime.
+
+    This is deliberately an extension type and not a Python/Cython function,
+    since functions expose their module globals through attributes like
+    "func_globals".  Instances are only usable when created internally by
+    _new_mediated_builtin().
+    """
+    cdef object _filter
+    cdef object _getter
+    cdef object _setter
+    cdef bytes _source_encoding
+    cdef int _kind
+    cdef bint _initialised
+
+    def __call__(self, *args):
+        cdef Py_ssize_t nargs = len(args)
+        if not self._initialised:
+            raise TypeError("this builtin function object cannot be used")
+
+        if self._kind == MEDIATED_GETATTR:
+            if nargs == 2:
+                return self._getattr(args[0], args[1])
+            elif nargs == 3:
+                try:
+                    return self._getattr(args[0], args[1])
+                except AttributeError:
+                    return args[2]
+            raise TypeError("getattr() expected 2 or 3 arguments, got %d" % nargs)
+
+        elif self._kind == MEDIATED_HASATTR:
+            if nargs != 2:
+                raise TypeError("hasattr() expected 2 arguments, got %d" % nargs)
+            try:
+                self._getattr(args[0], args[1])
+            except AttributeError:
+                return False
+            return True
+
+        elif self._kind == MEDIATED_SETATTR:
+            if nargs != 3:
+                raise TypeError("setattr() expected 3 arguments, got %d" % nargs)
+            self._setattr(args[0], args[1], args[2])
+            return None
+
+        elif self._kind == MEDIATED_DELATTR:
+            if nargs != 2:
+                raise TypeError("delattr() expected 2 arguments, got %d" % nargs)
+            self._delattr(args[0], args[1])
+            return None
+
+        elif self._kind == MEDIATED_VARS:
+            if nargs == 0:
+                # vars() returns the locals of the calling frame.
+                raise TypeError(
+                    "vars() without arguments is not available when an "
+                    "attribute_filter or attribute_handlers is set")
+            if nargs != 1:
+                raise TypeError("vars() expected at most 1 argument, got %d" % nargs)
+            # The lookup goes through the filter/handlers, an AttributeError
+            # (access denied or no '__dict__') propagates as such.
+            return self._getattr(args[0], u'__dict__')
+
+        raise TypeError("unknown builtin function")
+
+    cdef object _getattr(self, obj, attr_name):
+        if self._getter is not None:
+            _refuse_introspection_attr(attr_name, self._source_encoding)
+            return self._getter(obj, attr_name)
+        if self._filter is not None:
+            attr_name = self._filter(obj, attr_name, False)
+        if isinstance(attr_name, bytes):
+            attr_name = (<bytes>attr_name).decode(self._source_encoding)
+        _refuse_introspection_attr(attr_name, self._source_encoding)
+        return getattr(obj, attr_name)
+
+    cdef int _setattr(self, obj, attr_name, attr_value) except -1:
+        if self._setter is not None:
+            _refuse_introspection_attr(attr_name, self._source_encoding)
+            self._setter(obj, attr_name, attr_value)
+        else:
+            if self._filter is not None:
+                attr_name = self._filter(obj, attr_name, True)
+            if isinstance(attr_name, bytes):
+                attr_name = (<bytes>attr_name).decode(self._source_encoding)
+            _refuse_introspection_attr(attr_name, self._source_encoding)
+            setattr(obj, attr_name, attr_value)
+        return 0
+
+    cdef int _delattr(self, obj, attr_name) except -1:
+        if self._getter is not None or self._setter is not None:
+            # attribute_handlers provide no hook for deleting attributes
+            raise AttributeError(
+                "deleting attributes is not supported with attribute_handlers")
+        if self._filter is not None:
+            attr_name = self._filter(obj, attr_name, True)
+        if isinstance(attr_name, bytes):
+            attr_name = (<bytes>attr_name).decode(self._source_encoding)
+        _refuse_introspection_attr(attr_name, self._source_encoding)
+        delattr(obj, attr_name)
+        return 0
+
+
+cdef _MediatedBuiltin _new_mediated_builtin(int kind, attribute_filter, getter, setter,
+                                            bytes source_encoding):
+    cdef _MediatedBuiltin func = _MediatedBuiltin.__new__(_MediatedBuiltin)
+    func._kind = kind
+    func._filter = attribute_filter
+    func._getter = getter
+    func._setter = setter
+    func._source_encoding = source_encoding
+    func._initialised = True
+    return func
+
+
+cdef object _filtered_builtins(attribute_filter, getter, setter, bytes source_encoding):
+    mod = type(builtins)(builtins.__name__)
+    namespace = mod.__dict__
+    namespace.update(builtins.__dict__)
+
+    # Each of these hands out the unmediated builtins module/dict or an
+    # unfiltered namespace, or runs Python code that bypasses the filter.
+    # (Some of them only exist in some Python versions.)
+    for name in ('globals', 'locals', 'eval', 'exec', 'execfile', 'compile',
+                 'breakpoint', '__builtins__'):
+        namespace.pop(name, None)
+
+    for name, kind in (('getattr', MEDIATED_GETATTR),
+                       ('hasattr', MEDIATED_HASATTR),
+                       ('setattr', MEDIATED_SETATTR),
+                       ('delattr', MEDIATED_DELATTR),
+                       ('vars', MEDIATED_VARS)):
+        namespace[name] = _new_mediated_builtin(
+            kind, attribute_filter, getter, setter, source_encoding)
+    return mod
 
 
 cdef int py_object_getindex_with_gil(lua_State* L, py_object* py_obj) with gil:
